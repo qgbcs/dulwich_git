@@ -986,3 +986,231 @@ if __name__=="__main__":
     except Exception as exc:
         if not LOG.handlers:setup_logging(2)
         LOG.error("失败: %s",exc,exc_info=LOG.isEnabledFor(logging.DEBUG));sys.exit(1)
+
+r'''
+
+C:\Users\Administrator\Documents\energetic>C:\QGB\anaconda3\python D:\test\github\dulwich_git\L988.py -v 3 -u push https://qgbcs:ghp_7xxx@github.com/qgbcs/_
+2026-09-26 08:21:49.816 | INFO    | Dulwich 版本: 1.2.15 | 网络: Python 标准库 http.client/socket/ssl
+2026-09-26 08:21:49.950 | INFO    | 仓库路径: C:\Users\Administrator\Documents\energetic
+2026-09-26 08:21:49.950 | INFO    | 远程地址: https://github.com/qgbcs/_.git | 分支: master
+2026-09-26 08:21:49.966 | INFO    | LFS 阈值: 100.00 MiB | 最大普通 Blob: 100.00 MiB
+2026-09-26 08:21:49.966 | INFO    | 连接超时: 45s | 低速: 10B/s 持续 60s | 每 0.50s 输出
+2026-09-26 08:21:49.966 | INFO    | 提交身份: qgbcs <qgbcs@users.noreply.github.com>
+2026-09-26 08:21:49.997 | INFO    | 扫描完成: 26 项 | 未跟踪且被忽略: 0 项
+2026-09-26 08:21:49.997 | ERROR   | 失败: 读取前文件已经变化: C:\Users\Administrator\Documents\energetic\.gitattributes
+Traceback (most recent call last):
+  File "D:\test\github\dulwich_git\L988.py", line 984, in <module>
+    main(a)
+  File "D:\test\github\dulwich_git\L988.py", line 839, in main
+    ids,empty=prepare(repo,a,identity,cache)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\test\github\dulwich_git\L988.py", line 392, in prepare
+    expected=repo.refs.follow(b"HEAD");index=repo.open_index();stage_all(repo,index,a,config,cache);writer=SHA1Writer(lock);write_index_dict(writer,dict(index.items()),version=3);ids,empty=commit_staged(repo,index,a,identity,expected);writer.close();return ids,empty
+                                                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\test\github\dulwich_git\L988.py", line 290, in stage_all
+    if attrs.get(rel).get(b"filter")==b"lfs":continue
+       ^^^^^^^^^^^^^^
+  File "D:\test\github\dulwich_git\L988.py", line 182, in get
+    levels.append((self.info,rel,None,True));loaded=[(self.load(p,key,macros),local) for p,local,key,macros in levels];definitions={b"binary":[(b"diff",False),(b"merge",False),(b"text",False)]};result={}
+                                                      ^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\test\github\dulwich_git\L988.py", line 161, in load
+    data=config_bytes(path)
+         ^^^^^^^^^^^^^^^^^^
+  File "D:\test\github\dulwich_git\L988.py", line 112, in config_bytes
+    try:return read_regular(path,8*1024*1024)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\test\github\dulwich_git\L988.py", line 106, in read_regular
+    with regular_reader(Path(path)) as (f,st):
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\QGB\anaconda3\Lib\contextlib.py", line 137, in __enter__
+    return next(self.gen)
+           ^^^^^^^^^^^^^^
+  File "D:\test\github\dulwich_git\L988.py", line 102, in regular_reader
+    if signature(os.fstat(f.fileno()))!=signature(before):raise StopPush(f"读取前文件已经变化: {path}")
+                                                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+StopPush: 读取前文件已经变化: C:\Users\Administrator\Documents\energetic\.gitattributes
+
+C:\Users\Administrator\Documents\energetic>C:\QGB\anaconda3\python D:\test\github\dulwich_git\L988.py --self-test
+test_attr_c_quote_and_macro (__main__.self_test.<locals>.Tests.test_attr_c_quote_and_macro) ... ok
+test_git_smart_http_and_idempotent_push (__main__.self_test.<locals>.Tests.test_git_smart_http_and_idempotent_push) ... Traceback (most recent call last):
+  File "C:\QGB\anaconda3\Lib\wsgiref\handlers.py", line 138, in run
+    self.finish_response()
+  File "C:\QGB\anaconda3\Lib\wsgiref\handlers.py", line 183, in finish_response
+    for data in self.result:
+                ^^^^^^^^^^^
+  File "C:\QGB\anaconda3\Lib\site-packages\dulwich\web.py", line 633, in handle_service_request
+    handler.handle()
+  File "C:\QGB\anaconda3\Lib\site-packages\dulwich\server.py", line 1777, in handle
+    status = list(self._apply_pack(client_refs))
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\QGB\anaconda3\Lib\site-packages\dulwich\server.py", line 1498, in _apply_pack
+    self.repo.object_store.add_thin_pack(  # type: ignore[attr-defined]
+TypeError: MemoryObjectStore.add_thin_pack() got an unexpected keyword argument 'max_input_size'
+Traceback (most recent call last):
+  File "C:\QGB\anaconda3\Lib\wsgiref\handlers.py", line 138, in run
+    self.finish_response()
+  File "C:\QGB\anaconda3\Lib\wsgiref\handlers.py", line 183, in finish_response
+    for data in self.result:
+                ^^^^^^^^^^^
+  File "C:\QGB\anaconda3\Lib\site-packages\dulwich\web.py", line 633, in handle_service_request
+    handler.handle()
+  File "C:\QGB\anaconda3\Lib\site-packages\dulwich\server.py", line 1777, in handle
+    status = list(self._apply_pack(client_refs))
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\QGB\anaconda3\Lib\site-packages\dulwich\server.py", line 1498, in _apply_pack
+    self.repo.object_store.add_thin_pack(  # type: ignore[attr-defined]
+TypeError: MemoryObjectStore.add_thin_pack() got an unexpected keyword argument 'max_input_size'
+ERROR
+test_global_exclude_precedence (__main__.self_test.<locals>.Tests.test_global_exclude_precedence) ... ok
+test_history_pointer_and_large_blob (__main__.self_test.<locals>.Tests.test_history_pointer_and_large_blob) ... ERROR
+test_ignore_lfs_delete_and_no_process (__main__.self_test.<locals>.Tests.test_ignore_lfs_delete_and_no_process) ... ERROR
+test_low_speed_watchdog (__main__.self_test.<locals>.Tests.test_low_speed_watchdog) ... ok
+test_missing_lfs_cache_and_cli (__main__.self_test.<locals>.Tests.test_missing_lfs_cache_and_cli) ... ok
+test_network_retry_http_and_lfs (__main__.self_test.<locals>.Tests.test_network_retry_http_and_lfs) ... ERROR
+test_split_commits_and_local_push (__main__.self_test.<locals>.Tests.test_split_commits_and_local_push) ... ERROR
+test_symlink_does_not_walk_target (__main__.self_test.<locals>.Tests.test_symlink_does_not_walk_target) ... ok
+test_url_and_retry_classification (__main__.self_test.<locals>.Tests.test_url_and_retry_classification) ... ok
+
+======================================================================
+ERROR: test_git_smart_http_and_idempotent_push (__main__.self_test.<locals>.Tests.test_git_smart_http_and_idempotent_push)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\test\github\dulwich_git\L988.py", line 925, in test_git_smart_http_and_idempotent_push
+    for _ in range(2):push_target(self.repo,self.a,url,b"refs/heads/main",self.repo.head(),url+"/info/lfs/objects/batch",{},self.cache,set())
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\test\github\dulwich_git\L988.py", line 726, in push_target
+    retry(a,f"推送 {safe_url(remote)} {text(ref)}",attempt)
+  File "D:\test\github\dulwich_git\L988.py", line 702, in retry
+    try:return operation()
+               ^^^^^^^^^^^
+  File "D:\test\github\dulwich_git\L988.py", line 718, in attempt
+    result=client.send_pack(urlsplit(remote).path,update,generate,progress=remote_progress,push_options=[v.encode() for v in a.push_option] or None,atomic=a.atomic)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\QGB\anaconda3\Lib\site-packages\dulwich\client.py", line 4931, in send_pack
+    resp, read = self._smart_request("git-receive-pack", url, data=body_generator())
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\QGB\anaconda3\Lib\site-packages\dulwich\client.py", line 4808, in _smart_request
+    resp, read = self._http_request(url, headers, data)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\test\github\dulwich_git\L988.py", line 624, in _http_request
+    response=self.net.request("GET" if data is None else "POST",url,headers,data,"Git HTTP body",allow_error=not raise_for_status)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\test\github\dulwich_git\L988.py", line 592, in request
+    body=wrapper.read(4096).decode("utf-8","replace");delay=retry_delay(raw.getheader("Retry-After"));wrapper.close();raise HTTPFailure(raw.status,url,body[:600],delay)
+                                                                                                                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+HTTPFailure: HTTP 500 http://127.0.0.1:65242/test.git/git-receive-pack A server error occurred.  Please contact the administrator.
+
+======================================================================
+ERROR: test_history_pointer_and_large_blob (__main__.self_test.<locals>.Tests.test_history_pointer_and_large_blob)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\test\github\dulwich_git\L988.py", line 912, in test_history_pointer_and_large_blob
+    self.write("large.bin",b"q"*600);self.stage();index=self.repo.open_index();oid,size=pointer_info(self.repo.object_store[index[b"large.bin"].sha].data);(self.root/"large.bin").unlink();self.stage();self.assertEqual(outgoing_lfs(self.repo,{},self.repo.head(),self.a)[oid],size)
+                                     ^^^^^^^^^^^^
+  File "D:\test\github\dulwich_git\L988.py", line 883, in stage
+    def stage(self):return prepare(self.repo,self.a,self.identity,self.cache)
+                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\test\github\dulwich_git\L988.py", line 392, in prepare
+    expected=repo.refs.follow(b"HEAD");index=repo.open_index();stage_all(repo,index,a,config,cache);writer=SHA1Writer(lock);write_index_dict(writer,dict(index.items()),version=3);ids,empty=commit_staged(repo,index,a,identity,expected);writer.close();return ids,empty
+                                                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\test\github\dulwich_git\L988.py", line 320, in stage_all
+    effective=attrs.get(rel)
+              ^^^^^^^^^^^^^^
+  File "D:\test\github\dulwich_git\L988.py", line 182, in get
+    levels.append((self.info,rel,None,True));loaded=[(self.load(p,key,macros),local) for p,local,key,macros in levels];definitions={b"binary":[(b"diff",False),(b"merge",False),(b"text",False)]};result={}
+                                                      ^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\test\github\dulwich_git\L988.py", line 161, in load
+    data=config_bytes(path)
+         ^^^^^^^^^^^^^^^^^^
+  File "D:\test\github\dulwich_git\L988.py", line 112, in config_bytes
+    try:return read_regular(path,8*1024*1024)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\test\github\dulwich_git\L988.py", line 106, in read_regular
+    with regular_reader(Path(path)) as (f,st):
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\QGB\anaconda3\Lib\contextlib.py", line 137, in __enter__
+    return next(self.gen)
+           ^^^^^^^^^^^^^^
+  File "D:\test\github\dulwich_git\L988.py", line 102, in regular_reader
+    if signature(os.fstat(f.fileno()))!=signature(before):raise StopPush(f"读取前文件已经变化: {path}")
+                                                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+StopPush: 读取前文件已经变化: C:\Users\ADMINI~1\AppData\Local\Temp\tmpfwcv3mo5\repo\.gitattributes
+
+======================================================================
+ERROR: test_ignore_lfs_delete_and_no_process (__main__.self_test.<locals>.Tests.test_ignore_lfs_delete_and_no_process)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\test\github\dulwich_git\L988.py", line 885, in test_ignore_lfs_delete_and_no_process
+    self.write("tracked.tmp",b"old");self.stage();self.write("tracked.tmp",b"new");self.write(".gitignore",b"*.tmp\n!keep.tmp\nblocked/\n!blocked/no.txt\nselect/*\n!select/keep.txt\nignored-large.bin\n");self.write("drop.tmp",b"drop");self.write("keep.tmp",b"keep");self.write("blocked/no.txt",b"no");self.write("select/keep.txt",b"yes");self.write("select/no.txt",b"no");self.write("ignored-large.bin",b"x"*600);self.write("has space.bin",b"a"*600);self.write(".gitattributes",b"*.lfs filter=lfs diff=lfs merge=lfs -text\n");self.write("small.lfs",b"x");self.write("nested/.gitignore",b"!stay.tmp\n");self.write("nested/stay.tmp",b"stay")
+                                     ^^^^^^^^^^^^
+  File "D:\test\github\dulwich_git\L988.py", line 883, in stage
+    def stage(self):return prepare(self.repo,self.a,self.identity,self.cache)
+                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\test\github\dulwich_git\L988.py", line 392, in prepare
+    expected=repo.refs.follow(b"HEAD");index=repo.open_index();stage_all(repo,index,a,config,cache);writer=SHA1Writer(lock);write_index_dict(writer,dict(index.items()),version=3);ids,empty=commit_staged(repo,index,a,identity,expected);writer.close();return ids,empty
+                                                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\test\github\dulwich_git\L988.py", line 330, in stage_all
+    data=normalize_blob(read_regular(path),effective,old,repo,config,rel,a.renormalize)
+                        ^^^^^^^^^^^^^^^^^^
+  File "D:\test\github\dulwich_git\L988.py", line 106, in read_regular
+    with regular_reader(Path(path)) as (f,st):
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\QGB\anaconda3\Lib\contextlib.py", line 137, in __enter__
+    return next(self.gen)
+           ^^^^^^^^^^^^^^
+  File "D:\test\github\dulwich_git\L988.py", line 102, in regular_reader
+    if signature(os.fstat(f.fileno()))!=signature(before):raise StopPush(f"读取前文件已经变化: {path}")
+                                                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+StopPush: 读取前文件已经变化: C:\Users\ADMINI~1\AppData\Local\Temp\tmpcdr48oll\repo\tracked.tmp
+
+======================================================================
+ERROR: test_network_retry_http_and_lfs (__main__.self_test.<locals>.Tests.test_network_retry_http_and_lfs)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\test\github\dulwich_git\L988.py", line 963, in test_network_retry_http_and_lfs
+    self.assertEqual(counters["/unauthorized"],1);self.assertEqual(get("/redirect"),b"");self.write("payload",b"binary"*100);oid,size=pointer_info(self.cache.put(self.root/"payload"));done=set();upload_lfs(net,base+"/batch",{oid:size},self.cache,b"refs/heads/main",done);self.assertIn((oid,size),done);self.assertEqual(stored[oid],b"binary"*100);self.assertEqual(counters["put-path"],"/upload?signature=kept")
+                                                                                                                                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\test\github\dulwich_git\L988.py", line 216, in put
+    with os.fdopen(fd,"wb") as out,regular_reader(path) as (f,st):
+                                   ^^^^^^^^^^^^^^^^^^^^
+  File "C:\QGB\anaconda3\Lib\contextlib.py", line 137, in __enter__
+    return next(self.gen)
+           ^^^^^^^^^^^^^^
+  File "D:\test\github\dulwich_git\L988.py", line 102, in regular_reader
+    if signature(os.fstat(f.fileno()))!=signature(before):raise StopPush(f"读取前文件已经变化: {path}")
+                                                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+StopPush: 读取前文件已经变化: C:\Users\ADMINI~1\AppData\Local\Temp\tmp4d009i99\repo\payload
+
+======================================================================
+ERROR: test_split_commits_and_local_push (__main__.self_test.<locals>.Tests.test_split_commits_and_local_push)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\test\github\dulwich_git\L988.py", line 907, in test_split_commits_and_local_push
+    commits,_=self.stage();self.assertEqual(len(commits),3);remote=Repo.init_bare(str(Path(self.temp.name)/"bare"),mkdir=True)
+              ^^^^^^^^^^^^
+  File "D:\test\github\dulwich_git\L988.py", line 883, in stage
+    def stage(self):return prepare(self.repo,self.a,self.identity,self.cache)
+                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\test\github\dulwich_git\L988.py", line 392, in prepare
+    expected=repo.refs.follow(b"HEAD");index=repo.open_index();stage_all(repo,index,a,config,cache);writer=SHA1Writer(lock);write_index_dict(writer,dict(index.items()),version=3);ids,empty=commit_staged(repo,index,a,identity,expected);writer.close();return ids,empty
+                                                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\test\github\dulwich_git\L988.py", line 330, in stage_all
+    data=normalize_blob(read_regular(path),effective,old,repo,config,rel,a.renormalize)
+                        ^^^^^^^^^^^^^^^^^^
+  File "D:\test\github\dulwich_git\L988.py", line 106, in read_regular
+    with regular_reader(Path(path)) as (f,st):
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\QGB\anaconda3\Lib\contextlib.py", line 137, in __enter__
+    return next(self.gen)
+           ^^^^^^^^^^^^^^
+  File "D:\test\github\dulwich_git\L988.py", line 102, in regular_reader
+    if signature(os.fstat(f.fileno()))!=signature(before):raise StopPush(f"读取前文件已经变化: {path}")
+                                                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+StopPush: 读取前文件已经变化: C:\Users\ADMINI~1\AppData\Local\Temp\tmp1_jku6m7\repo\file0
+
+----------------------------------------------------------------------
+Ran 11 tests in 3.876s
+
+FAILED (errors=5)
+
+'''
