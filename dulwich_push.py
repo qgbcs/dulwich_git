@@ -16,8 +16,8 @@ from dulwich.file import GitFile
 from dulwich.ignore import IgnoreFilter,IgnoreFilterManager,default_user_ignore_filter_path
 from dulwich.index import IndexEntry,commit_tree,index_entry_from_stat,write_index_dict,validate_path,get_path_element_validator
 from dulwich.object_store import MissingObjectFinder,iter_tree_contents
-from dulwich.objects import Blob,Commit
-from dulwich.pack import SHA1Writer
+from dulwich.objects import Blob,Commit,Tag
+from dulwich.pack import SHA1Writer,pack_objects_to_data
 from dulwich.protocol import ZERO_SHA
 from dulwich.refs import check_ref_format
 from dulwich.repo import Repo
@@ -226,16 +226,76 @@ class LFSCache:
         storage=cfg(config or repo.get_config_stack(),b"lfs",b"storage");common=Path(repo.commondir()).resolve();base=Path(text(storage)).expanduser() if storage else common/"lfs"
         if not base.is_absolute():base=common/base
         self.base=base;self.verified={};self.sources={} # sources:(oid,size)->(工作区路径, file_id),零拷贝流式源,避免整文件复制撑爆磁盘
+        self.repo=repo#为了 lfs-cache
     def path(self,oid):
         if not re.fullmatch(r"[a-f0-9]{64}",oid):raise StopPush("无效的 LFS SHA256")
         return self.base/"objects"/oid[:2]/oid[2:4]/oid
-    def hash_source(self,path): # 只流式计算 oid/size,不落盘;读取期间文件变化由 regular_reader 直接报错
-        h=hashlib.sha256();size=0;last=time.monotonic()
-        with regular_reader(path) as (f,st):
-            for block in iter(lambda:f.read(1024*1024),b""):
-                h.update(block);size+=len(block)
-                if time.monotonic()-last>=1:LOG.info("LFS 指纹计算: %s | %s/%s",Path(path).name,human(size),human(st.st_size));last=time.monotonic()
-        return h.hexdigest(),size
+            
+    def _load_hash_cache(self):
+        """只读 .git/config 里的缓存注释行;文件缺失或解析失败都返回空 dict,绝不抛异常。
+        返回 {(relpath, size, mtime_ns): sha256}。"""
+        CACHE_PREFIX = "#lfs-cache\t"
+        cache = {}
+        cache_file="qgb-lfs-cache.txt"
+        cfg_path = Path(self.repo.controldir()) / cache_file
+        try:
+            data = cfg_path.read_text(encoding="utf-8", errors="surrogateescape")
+        except OSError:
+            return cache
+        for line in data.splitlines():
+            if not line.startswith(CACHE_PREFIX):
+                continue
+            parts = line[len(CACHE_PREFIX):].split("\t", 3)
+            if len(parts) != 4 or not re.fullmatch(r"[0-9a-f]{64}", parts[0]):
+                continue
+            try:
+                size = int(parts[1]); mtime_ns = int(parts[2])
+            except ValueError:
+                continue
+            cache[(parts[3], size, mtime_ns)] = parts[0]
+        return cache
+
+    def hash_source(self, path):
+        """只流式计算 oid/size,不落盘;读取期间文件变化由 regular_reader 直接报错。
+        若 cache_file 里存在同仓库相对路径 + 同 size + 同 mtime_ns 的缓存注释,直接返回其 sha256,跳过磁盘读取。
+        缓存只读不写;任何一步不满足(文件不存在、不是普通文件、路径不在仓库内、元数据对不上)都回退到原逻辑。"""
+        p = Path(path)
+        # 尝试命中缓存:失败一律静默回退,不影响原逻辑
+        try:
+            probe = p.lstat()
+        except OSError:
+            probe = None
+        if probe is not None and stat.S_ISREG(probe.st_mode):
+            cached = getattr(self, "_hash_cache", None)
+            if cached is None:
+                cached = self._load_hash_cache()
+                self._hash_cache = cached
+            repo_root = Path(self.repo.path).resolve()
+            try:
+                rel = p.resolve().relative_to(repo_root).as_posix()
+            except (ValueError, OSError):
+                rel = None
+            if rel is not None:
+                hit = cached.get((rel, probe.st_size, probe.st_mtime_ns))
+                if hit is not None:
+                    LOG.info("lfs-cache 指纹命中 缓存,跳过磁盘读取: %s | %s", path, human(probe.st_size))
+                    return hit, probe.st_size
+        # 原逻辑:流式读取,边读边算
+        h = hashlib.sha256(); size = 0; last = time.monotonic()
+        with regular_reader(path) as (f, st):
+            for block in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(block); size += len(block)
+                if time.monotonic() - last >= 1:
+                    LOG.info("LFS 指纹计算: %s | %s/%s", path, human(size), human(st.st_size))
+                    last = time.monotonic()
+        return h.hexdigest(), size        
+    # def hash_source(self,path): # 只流式计算 oid/size,不落盘;读取期间文件变化由 regular_reader 直接报错
+        # h=hashlib.sha256();size=0;last=time.monotonic()
+        # with regular_reader(path) as (f,st):
+            # for block in iter(lambda:f.read(1024*1024),b""):
+                # h.update(block);size+=len(block)
+                # if time.monotonic()-last>=1:LOG.info("LFS 指纹计算: %s | %s/%s",path,human(size),human(st.st_size));last=time.monotonic()
+        # return h.hexdigest(),size
     def stage_source(self,path): # 登记工作区源并返回指针;零额外磁盘占用
         oid,size=self.hash_source(path);p=Path(path);self.sources[(oid,size)]=(p,file_id(p.lstat()));return pointer_bytes(oid,size)
     def import_object(self,source): # 仅手工指针场景显式导入对象,复制进缓存并校验
@@ -532,18 +592,38 @@ class Response: # dulwich 需要的响应接口,读取与连接释放纳入监�
         if self.closed:return
         self.closed=True;self.meter.close();self.raw.close();self.connection.close();self.net.live.discard(self);trace(self.net.a,"== Connection closed: %s | 上传 %s | 接收 %s",safe_url(self.url),human(self.meter.sent),human(self.meter.received))
 @contextmanager
-def request_body(data): # 请求体落临时文件:避免整包常驻内存,并让 307/308 可安全重放
-    owned=None
+def request_body(data,cache=None): # 请求体落临时文件:避免整包常驻内存,并让 307/308 可安全重放;cache 非空时 PACK 只生成一次并跨网络重试复用
+    if data is None:yield None,0,0;return
+    pack=cache.get("pack") if cache is not None else None
+    if pack is not None: # 同一远端公告下重试:直接重放已固化 PACK,不重新扫描对象/压缩
+        reused=open(pack["path"],"rb")
+        try:
+            LOG.info("复用已缓存 PACK(跳过对象计算与压缩): %s",human(pack["length"]));yield reused,pack["length"],0
+        finally:
+            reused.close()
+        return
+    owned=None;persist=cache is not None
     try:
-        if data is None:yield None,0,0;return
         if isinstance(data,(bytes,bytearray,memoryview)):owned=io.BytesIO(bytes(data));stream=owned;start=0
         elif hasattr(data,"read") and hasattr(data,"seek"):stream=data;start=stream.tell() # 尊重调用方当前位置,不强行回到 0
         else:
-            owned=tempfile.TemporaryFile();stream=owned;start=0;size=0;last=time.monotonic();LOG.info("准备 Git 请求体到临时文件,尚未开始网络上传")
+            if persist:
+                fd,name=tempfile.mkstemp(prefix=".purepush-pack-",suffix=".tmp");owned=os.fdopen(fd,"w+b")
+            else:
+                name=None;owned=tempfile.TemporaryFile()
+            stream=owned;start=0;size=0;last=time.monotonic();LOG.info("准备 Git 请求体到临时文件,尚未开始网络上传")
             for block in data:
                 stream.write(block);size+=len(block)
                 if time.monotonic()-last>=1:LOG.info("PACK 本地准备: %s",human(size));last=time.monotonic()
-        stream.seek(0,2);length=stream.tell()-start;stream.seek(start);yield stream,length,start
+        stream.seek(0,2);length=stream.tell()-start
+        if persist: # 固化为命名文件供后续重试原样重放;BytesIO/外部流则复制一份
+            stream.flush();name=getattr(stream,"name",None)
+            if not isinstance(name,str):
+                fd,name=tempfile.mkstemp(prefix=".purepush-pack-",suffix=".tmp");persisted=os.fdopen(fd,"w+b");stream.seek(start);shutil.copyfileobj(stream,persisted,1024*1024);persisted.flush();persisted.close()
+                if owned is not None:owned.close();owned=None
+                stream=open(name,"rb");start=0;stream.seek(0,2);length=stream.tell()
+            cache["pack"]={"path":name,"length":length};LOG.info("PACK 已固化缓存: %s | 网络重试将直接复用,不重算对象",human(length))
+        stream.seek(start);yield stream,length,start
     finally:
         if owned is not None:owned.close()
 def retry_delay(value):
@@ -569,8 +649,16 @@ def json_request(net,url,payload,headers=None,label="LFS batch"):
         try:return json.loads(body)
         except ValueError as exc:raise StopPush("LFS 服务端未返回有效 JSON") from exc
     finally:r.close()
+def github_api_repo(remote): # github.com/GHE 仓库 API 根;非 GitHub 形态返回 None
+    p=urlsplit(remote)
+    if p.scheme!="https" or not p.hostname:return None
+    parts=[x for x in p.path.strip("/").split("/") if x]
+    if len(parts)<2:return None
+    slug="/".join(parts[:2]).removesuffix(".git")
+    if p.hostname in ("github.com","www.github.com"):return "https://api.github.com/repos/"+slug
+    return "https://%s/api/v3/repos/%s"%(p.hostname,slug) # GitHub Enterprise 约定前缀
 class Transport: # Git/LFS 共用标准库传输;默认校验证书;凭据按 origin 绑定
-    def __init__(self,a,auths=None,require_tls=False):self.a=a;self.auths=auths or {};self.live=set();self.require_tls=require_tls
+    def __init__(self,a,auths=None,require_tls=False,pack_cache=None):self.a=a;self.auths=auths or {};self.live=set();self.require_tls=require_tls;self.pack_cache=pack_cache
     def close(self):
         for r in list(self.live):r.close()
     def proxy(self,url):
@@ -614,7 +702,8 @@ class Transport: # Git/LFS 共用标准库传输;默认校验证书;凭据按 or
         finally:guard.cancel()
     def request(self,method,url,headers=None,data=None,label="HTTP",allow_error=False):
         original=url;extra={str(k):str(v) for k,v in (headers or {}).items()}
-        with request_body(data) as (stream,length,start):
+        use_cache=self.pack_cache is not None and method=="POST" and data is not None and urlsplit(url).path.endswith("git-receive-pack") and not isinstance(data,(bytes,bytearray,memoryview)) and not hasattr(data,"seek")
+        with request_body(data,self.pack_cache if use_cache else None) as (stream,length,start):
             for redirect in range(6):
                 p=urlsplit(url)
                 if p.scheme not in ("http","https") or not p.hostname or p.username is not None:raise StopPush("HTTP 请求地址无效或包含未拆分凭据")
@@ -710,28 +799,163 @@ def retry(a,label,operation): # 仅网络瞬断/超时/可恢复 HTTP 状态重�
         except Exception as exc:
             if not is_retryable(exc) or attempt==a.retry:raise
             delay=max(a.retry_wait,getattr(exc,"retry_after",0));LOG.warning("网络错误,%.1fs 后重试;下次重新探测引用与申请 LFS action: %s",delay,exc);time.sleep(delay)
+def peel_commit_shas(store,shas): # 公告 tip 剥 annotated tag -> commit SHA 集合;本地不存在的 tip 保守忽略
+    out=set()
+    for sha in shas:
+        if not sha or sha==ZERO_SHA or sha not in store:continue
+        obj=store[sha]
+        while isinstance(obj,Tag):obj=store[obj.object[1]]
+        if isinstance(obj,Commit):out.add(obj.id)
+    return out
+def walk_tree_ids(store,tree_sha,out): # 自有递归保证闭包: 树/子树/Blob/符号链接; 显式跳过 gitlink(0o160000 会被 S_ISDIR 误判); 不使用 dulwich 有漏算的 get_tree_objects
+    out.add(tree_sha)
+    for _name,mode,sha in store[tree_sha].iteritems():
+        if mode==0o160000:continue
+        if stat.S_ISDIR(mode):walk_tree_ids(store,sha,out)
+        else:out.add(sha)
+def reachable_ids(store,commit_shas): # 这些提交可达的全部对象(提交+树+Blob)
+    if not commit_shas:return set()
+    result=set(store.get_reachability_provider().get_reachable_commits(commit_shas))
+    for c in list(result):walk_tree_ids(store,store[c].tree,result)
+    return result
+def chunk_plan_make(repo,target,refs,threshold): # 按目标树中【真实引用】缺失普通 Blob 的原始大小贪心分组(压缩后只会更小);总量<=阈值返回 None。临时分支不参与分组: 保证重跑/重试时分组与检查点 SHA 稳定
+    prefix=b"refs/heads/push-tmp-"+target[:8]+b"-"
+    real={k:v for k,v in refs.items() if not k.startswith(prefix)}
+    store=repo.object_store;remote=reachable_ids(store,peel_commit_shas(store,real.values()));items=[]
+    for e in iter_tree_contents(store,repo[target].tree):
+        if e.mode not in (0o100644,0o100755) or e.sha in remote:continue
+        items.append((e.path,e.sha,e.mode,store[e.sha].raw_length()))
+    items.sort(key=lambda x:x[0]);total=sum(x[3] for x in items)
+    LOG.info("分块评估: 缺失普通 Blob %d 个 | 原始量 %s | 请求阈值 %s",len(items),human(total),human(threshold))
+    if total<=threshold:return None
+    groups=[];cur=[];size=0
+    for item in items:
+        if cur and size+item[3]>threshold:groups.append(cur);cur=[];size=0
+        cur.append(item);size+=item[3]
+    if cur:groups.append(cur)
+    over=[sum(x[3] for x in g) for g in groups if sum(x[3] for x in g)>threshold]
+    if over:LOG.warning("有 %d 个分块超过阈值: 单个普通 Blob 本身就过大,无法再切(该类文件应走 LFS)",len(over))
+    return groups
+def checkpoint_commit(repo,entries,parent,base): # 累积子集检查点提交: 含真实 Blob(同 SHA),元数据确定性派生自目标提交 -> 同目标 SHA 跨重跑稳定,可断点续传
+    c=Commit();c.tree=commit_tree(repo.object_store,[(p,s,m) for p,s,m,_ in entries]);c.parents=[parent] if parent else []
+    c.author=c.committer=base.author;c.author_time=c.commit_time=base.commit_time;c.author_timezone=c.commit_timezone=base.commit_timezone;c.message=b"purepush http chunk checkpoint\n"
+    c.check();repo.object_store.add_object(c);return c.id
 def push_target(repo,a,remote,ref,target,endpoint,auths,cache,done,lease=None): # 每次重试重读公告引用;响应丢失但引用已更新时按幂等成功处理
+    holder={"advert":None,"pointers":None,"pack":None,"tmp":[]} # 跨重试复用:公告不变则 LFS 扫描与 PACK 字节都不变,不重算
+    def drop_pack():
+        pack=holder.pop("pack",None)
+        if pack:
+            with suppress(OSError):os.unlink(pack["path"])
     def attempt():
-        net=Transport(a,auths,urlsplit(remote).scheme=="https");client=StdlibGitClient(remote,net);rp=Progress("remote: ");pp=Progress("PACK: ");observed={}
+        net=Transport(a,auths,urlsplit(remote).scheme=="https",pack_cache=holder);client=StdlibGitClient(remote,net);rp=Progress("remote: ");pp=Progress("PACK: ");observed={};path=urlsplit(remote).path
+        def repair_github_default(): # 检查点成了仓库默认分支时 GitHub 拒绝删除: PATCH 默认分支为真实引用,成功返回 True
+            if not ref.startswith(b"refs/heads/"):return False
+            api=github_api_repo(remote);token=auths.get(origin(remote))
+            if not api or not token:return False
+            short=text(ref)[len("refs/heads/"):]
+            try:
+                r=net.request("PATCH",api,{"accept":"application/vnd.github+json","content-type":"application/json","x-github-api-version":"2022-11-28"},json.dumps({"default_branch":short},separators=(",",":")).encode(),"GitHub API",allow_error=True)
+                try:
+                    body=read_limited(r);ok=200<=r.status<300
+                    if ok:LOG.info("检查点此前被 GitHub 设为了仓库默认分支;已通过 API 将默认分支切回 %s",short)
+                    else:LOG.warning("切换 GitHub 默认分支到 %s 被拒(HTTP %d): %s;请在仓库 Settings 手动改默认分支后重跑",short,r.status,body[:300].decode("utf-8","replace"))
+                finally:r.close()
+            except Exception as exc:LOG.warning("调用 GitHub API 切换默认分支失败(可在仓库 Settings 手动处理): %s",exc);return False
+            return ok
+        def delete_refs(names): # 只删引用不发对象;批量后对失败项逐个单发重试;返回最终仍失败的 {ref: 服务端原因}
+            if not names:return {}
+            def zgen(have,want,**kwargs):return pack_objects_to_data([],progress=pp)
+            def why(m,k): # dulwich 1.2.15 的 ref_status 原因是 str,兼容 bytes
+                v=(m or {}).get(k);return v if isinstance(v,str) else (v.decode("utf-8","replace") if isinstance(v,(bytes,bytearray)) else str(v))
+            rr=client.send_pack(path,lambda advertised:{n:ZERO_SHA for n in names},zgen,progress=rp);bad={k:why(rr.ref_status,k) for k in names if (rr.ref_status or {}).get(k)}
+            if bad and len(names)>1: # 批量中个别被拒时单发重试,排除批内引用互相牵连
+                for k in list(bad):
+                    one=client.send_pack(path,lambda advertised,kk=k:{kk:ZERO_SHA},zgen,progress=rp);reason=why(one.ref_status,k)
+                    if reason:bad[k]=reason
+                    else:del bad[k]
+            stuck=[k for k,v in bad.items() if "current branch" in (v or "").lower()] # GitHub: 仓库默认分支禁止删除 -> 先改默认分支再删
+            if stuck and repair_github_default():
+                for k in stuck:
+                    one=client.send_pack(path,lambda advertised,kk=k:{kk:ZERO_SHA},zgen,progress=rp);reason=why(one.ref_status,k)
+                    if reason:bad[k]=reason
+                    else:del bad[k]
+            return bad
+        def report_bad(title,bad):LOG.warning("%s: %s",title,["%s -> %s"%(text(k),v) for k,v in bad.items()])
         try:
             def update(refs):
+                key=tuple(sorted((k,v) for k,v in refs.items() if not k.startswith(b"refs/heads/push-tmp-"))) # 排除本工具自己的检查点引用: 它们推进只代表分块进度,不得作废 LFS/PACK 缓存
+                if holder["advert"]!=key:
+                    holder["advert"]=key;holder["pointers"]=None;drop_pack()
                 old=refs.get(ref) or ZERO_SHA;observed["old"]=old
                 if old==target:LOG.info("远端已是目标提交,可能上次成功后响应丢失: %s",target.decode());return {}
                 if lease is not None and old!=lease:raise StopPush("force-with-lease 条件不满足,远端已变化")
                 if not a.force and lease is None and not ancestor(repo,old,target):raise StopPush("non-fast-forward:远端不是本地目标祖先;请先获取/合并远端历史,重试不能解决")
-                pointers=outgoing_lfs(repo,refs,target,a);upload_lfs(net,endpoint,pointers,cache,ref,done);return {ref:target} # LFS 任一失败则 pack 不开始
+                if holder["pointers"] is None:holder["pointers"]=outgoing_lfs(repo,refs,target,a) # 53 秒级全历史扫描只做一次
+                upload_lfs(net,endpoint,holder["pointers"],cache,ref,done);return {ref:target} # LFS 任一失败则 pack 不开始;done 集合跨重试去重
             def generate(have,want,**kwargs):
                 kwargs["progress"]=pp
                 return repo.generate_pack_data({s for s in have if s in repo.object_store},want,**kwargs)
-            result=client.send_pack(urlsplit(remote).path,update,generate,progress=rp,push_options=[v.encode() for v in a.push_option] or None,atomic=a.atomic)
+            groups=None
+            if a.http_chunk_size: # 先手工探测一次引用做校验/LFS/分块评估;send_pack 内部会再取一次(小 GET)
+                advert=dict(client.get_refs(path).refs)
+                if not update(advert):
+                    stale_prefix=b"refs/heads/push-tmp-"+target[:8]+b"-"
+                    leftovers=[k for k in advert if k.startswith(stale_prefix)] # 收尾已成功但响应丢失的场景: 目标引用已到位,仍要清掉本目标遗留检查点
+                    if leftovers:
+                        bad=delete_refs(leftovers)
+                        if bad:report_bad("部分遗留临时分支被服务端拒绝删除(不影响推送结果;GitHub 常见原因: 分支保护/ruleset 或存在打开的 PR)",bad)
+                        else:LOG.info("目标已在服务端,顺带清理 %d 个遗留临时分支",len(leftovers))
+                    return # 远端已是目标(幂等成功)
+                groups=chunk_plan_make(repo,target,advert,a.http_chunk_size)
+            if groups:
+                if a.atomic:raise StopPush("--atomic 与 --http-chunk-size 不兼容: 分块是多个独立 POST,无法整体原子提交")
+                if a.push_option:raise StopPush("--push-option 与 --http-chunk-size 暂不支持同时使用(push option 会作用于检查点请求)")
+                net.pack_cache=None;store=repo.object_store;base=repo[target]
+                def manual_send(updates): # 显式对象集 PACK: 按公告引用可达对象做集合差,绕开 MissingObjectFinder 只认祖先边界的限制
+                    def gen(have,want,**kwargs):
+                        remote_ids=reachable_ids(store,peel_commit_shas(store,have));need=reachable_ids(store,peel_commit_shas(store,want));ids=sorted(need-remote_ids)
+                        LOG.info("本请求 PACK 对象 %d 个 | 远端可达 %d | 目标可达 %d",len(ids),len(remote_ids),len(need))
+                        return pack_objects_to_data([(store[i],None) for i in ids],ofs_delta=kwargs.get("ofs_delta",True),progress=pp)
+                    def guard(advertised): # 收尾前确认目标引用没被别人改动;临时分支创建不做此检查
+                        if ref in updates:
+                            now=advertised.get(ref) or ZERO_SHA
+                            if now not in (observed.get("old"),target):raise StopPush("推送期间目标引用被其他进程改变,已中止分块收尾")
+                        return dict(updates)
+                    return client.send_pack(path,guard,gen,progress=rp)
+                tmp_prefix=b"refs/heads/push-tmp-"+target[:8]+b"-";present={v for k,v in advert.items() if k.startswith(tmp_prefix)} # 服务端已有的本目标检查点,按【内容 SHA】识别: 阈值/分组方案变化也不会撞序号名
+                cumulative=[];parent=None;tmps=[]
+                for n,group in enumerate(groups[:-1],1): # 最后一组随真实引用收尾
+                    cumulative.extend(group);cp=checkpoint_commit(repo,cumulative,parent,base);parent=cp
+                    tmpref=tmp_prefix+str(n).encode()+b"-"+cp[:8];tmps.append(tmpref) # 名字内嵌内容 SHA,天然唯一
+                    if cp in present:LOG.info("检查点 %d/%d 内容已在服务端(断点续传),跳过上传",n,len(groups)-1);continue
+                    LOG.info("===== 分块检查点 %d/%d | 本组原始量 %s =====",n,len(groups)-1,human(sum(x[3] for x in group)))
+                    cr=manual_send({tmpref:cp});cs=cr.ref_status or {}
+                    if any(cs.values()):raise StopPush("远端拒绝临时检查点引用: "+repr(cs))
+                    present.add(cp);advert[tmpref]=cp
+                holder["tmp"]=tmps
+                LOG.info("===== 分块收尾: 更新真实引用 %s =====",text(ref))
+                result=manual_send({ref:target})
+                existing=[t for t in advert if t.startswith(tmp_prefix)] # 仅清理本目标的检查点(含旧命名),避免误删并发推送其他目标的临时分支;对象随最终历史保留
+                if existing:
+                    bad=delete_refs(existing)
+                    if bad:report_bad("部分临时分支被服务端拒绝删除(不影响推送结果;GitHub 常见原因: 分支保护/ruleset 或存在打开的 PR)",bad)
+                    else:LOG.info("已删除 %d 个临时分支",len(existing))
+                holder["tmp"]=[]
+            else:
+                result=client.send_pack(path,update,generate,progress=rp,push_options=[v.encode() for v in a.push_option] or None,atomic=a.atomic)
             statuses=result.ref_status or {}
             if any(statuses.values()):raise StopPush("远端拒绝引用更新: "+repr(statuses))
             if observed.get("old")!=target and ref not in statuses:
-                current=client.get_refs(urlsplit(remote).path).refs.get(ref)
+                current=client.get_refs(path).refs.get(ref)
                 if current!=target:raise StopPush("服务端未确认目标引用,不能报告成功")
             LOG.info("推送成功: %s -> %s",text(ref),target.decode())
         finally:rp.finish();pp.finish();net.close();client.close()
-    retry(a,f"推送 {safe_url(remote)} {text(ref)}",attempt)
+    success=False
+    try:
+        retry(a,f"推送 {safe_url(remote)} {text(ref)}",attempt);success=True
+    finally:
+        drop_pack()
+        if not success and holder["tmp"]:LOG.warning("分块推送未完成;服务端临时分支已保留,重跑同一目标会自动续传: %s",[text(x) for x in holder["tmp"]])
 def upload_lfs(net,endpoint,pointers,cache,ref,done): # batch 每组最多100;上传并 verify 成功才标记
     pending=[{"oid":oid,"size":size} for oid,size in sorted(pointers.items()) if (oid,size) not in done]
     for start in range(0,len(pending),100):
@@ -808,7 +1032,7 @@ def lfs_settings(repo,config,remote,remote_name,a,auths): # 支持独立 LFS end
     if token:auths[origin(clean)]=token
     return clean.rstrip("/")+"/objects/batch"
 def preprocess(argv): # 与参考脚本一致:-m 后全部构成消息;-u 不吞 push/URL
-    out=[];i=0;value_flags={"--repo","--repo-path","--path","-path","-p","--branch","-b","--size","-s","--threshold","--retry","-retry","-r","--retry-wait","--retry-seconds","--verbose","-v","--connect-timeout","--io-timeout","--low-speed-limit","--low-speed-time","--progress-interval","--max-commit-size","--max-pack-size","--max-blob-size","--name","--email","--proxy","--ca-file","--lfs-url","--push-option"}
+    out=[];i=0;value_flags={"--repo","--repo-path","--path","-path","-p","--branch","-b","--size","-s","--threshold","--retry","-retry","-r","--retry-wait","--retry-seconds","--verbose","-v","--connect-timeout","--io-timeout","--low-speed-limit","--low-speed-time","--progress-interval","--max-commit-size","--max-pack-size","--max-blob-size","--http-chunk-size","--chunk-size","--name","--email","--proxy","--ca-file","--lfs-url","--push-option"}
     while i<len(argv):
         arg=argv[i]
         if arg in ("-m","--message","--commit-msg","--commit_msg"):
@@ -837,6 +1061,7 @@ def make_parser():
     p.add_argument("mode",nargs="?",choices=["push"],default="push");p.add_argument("--remote",default="");p.add_argument("--repo","--repo-path","--path","-path","-p",default=".");p.add_argument("--branch","-b",default=os.environ.get("BRANCH"));p.add_argument("--user","-u","--auto-user",nargs="?",const="AUTO");p.add_argument("--name");p.add_argument("--email");p.add_argument("--message","-m","--commit-msg","--commit_msg",default="")
     p.add_argument("--no-ask","--noask","-noask","-y","-yes",action="store_true");p.add_argument("--size","-s",type=parse_size,default=100*1024**2);p.add_argument("--threshold",type=int,default=0);p.add_argument("--max-blob-size",type=parse_size,default=100*1024**2);p.add_argument("--max-commit-size",type=parse_size,default=1900*1024**2);p.add_argument("--max-pack-size",type=parse_size,default=1900*1024**2)
     p.add_argument("--retry","-retry","-r",type=int,default=10);p.add_argument("--retry-wait","--retry-seconds",type=float,default=5);p.add_argument("--verbose","-v","-verbosity",type=int,default=2);p.add_argument("--connect-timeout",type=float,default=45);p.add_argument("--io-timeout",type=float,default=300);p.add_argument("--low-speed-limit",type=int,default=10);p.add_argument("--low-speed-time",type=float,default=60);p.add_argument("--progress-interval",type=float,default=.5)
+    p.add_argument("--http-chunk-size","--chunk-size",type=parse_size,default=100*1024**2,help="单个 git-receive-pack 请求体阈值(按缺失普通Blob原始量计),超出则用临时分支检查点切成多个请求;0=关闭切分;LFS 不受影响")
     p.add_argument("--proxy");p.add_argument("--no-proxy",action="store_true");p.add_argument("--ca-file");p.add_argument("--lfs-url");p.add_argument("--no-auto-lfs",action="store_true");p.add_argument("--renormalize",action="store_true");p.add_argument("--force",action="store_true");p.add_argument("--force-with-lease",nargs="?",const="auto");p.add_argument("--set-upstream",action="store_true");p.add_argument("--push-option",action="append",default=[]);p.add_argument("--atomic",action="store_true");p.add_argument("--self-test",action="store_true")
     return p
 def arguments(argv=None):
@@ -845,6 +1070,7 @@ def arguments(argv=None):
     vals=(a.connect_timeout,a.io_timeout,a.progress_interval,a.retry_wait,a.low_speed_time)
     if not all(math.isfinite(x) for x in vals):p.error("时间参数不能是 NaN 或无穷大")
     if min(a.size,a.max_blob_size,a.max_commit_size,a.max_pack_size,a.connect_timeout,a.io_timeout,a.progress_interval)<=0 or a.retry<1 or min(a.low_speed_limit,a.low_speed_time,a.retry_wait)<0:p.error("大小/超时/间隔必须为正;retry>=1;低速参数与重试间隔不得为负")
+    if a.http_chunk_size<0:p.error("--http-chunk-size 不能为负(0 表示关闭切分)")
     if a.force and a.force_with_lease:p.error("--force 与 --force-with-lease 不能同时使用")
     if a.force_with_lease and a.force_with_lease!="auto" and not re.fullmatch("[0-9a-f]{40}",a.force_with_lease):p.error("--force-with-lease 需要 auto 或完整 40 位预期 ID")
     return a
@@ -1110,6 +1336,80 @@ def self_test():
             self.assertIsInstance(network_error(ssl.SSLError(1,"[SSL: WRONG_VERSION_NUMBER]")),StopPush) # 握手期协议/中间人问题不盲目重试
             self.assertIsInstance(network_error(ssl.SSLError(1,"[SSL: BAD_DECRYPT]"),True),NetworkFailure) # 同一错误发生在收发阶段则按线路瞬断重试
             self.assertIsInstance(network_error(ssl.SSLCertVerificationError("cert verify failed")),StopPush)
+        def test_28_http_chunk_split(self): # 网络分块: 每 POST 仅一个阈值内的 PACK;真实提交/分支只出现一次;临时分支清理干净;内容逐字节一致;检查点确定性可续传;二次推送幂等
+            self.a.size=self.a.max_blob_size=64*1024**2;N=26;UNIT=256*1024;THRESH=2*1024**2;payloads={}
+            for i in range(N):
+                d=os.urandom(UNIT);payloads[f"f{i:02d}.bin"]=d;self.write(f"f{i:02d}.bin",d)
+            self.stage();target=self.repo.head();bare,server,thread,url=self.smart_server();sent=[]
+            class Measured(Transport):
+                def request(self,method,u,headers=None,data=None,label="HTTP",allow_error=False):
+                    r=super().request(method,u,headers,data,label,allow_error)
+                    if method=="POST" and urlsplit(u).path.endswith("git-receive-pack"):sent.append(r.meter.sent)
+                    return r
+            old=globals()["Transport"];globals()["Transport"]=Measured;self.a.http_chunk_size=THRESH
+            try:
+                push_target(self.repo,self.a,url,b"refs/heads/main",target,url+"/info/lfs/objects/batch",{},self.cache,set())
+                self.assertEqual(len(sent),5,sent) # 3 检查点 + 1 收尾 + 1 批量删临时分支
+                for n in sent:self.assertLessEqual(n,THRESH+256*1024,(n,sent))
+                self.assertEqual(bare.refs[b"refs/heads/main"],target)
+                left=[r for r in list(bare.refs) if r.startswith(b"refs/heads/push-tmp-")];self.assertEqual(left,[])
+                remote=Repo(str(bare.path)) # Windows 下重开句柄才能看到新 pack
+                try:
+                    rc=remote[remote.refs[b"refs/heads/main"]]
+                    for e in iter_tree_contents(remote.object_store,rc.tree):
+                        if e.mode in (0o100644,0o100755):self.assertEqual(remote.object_store[e.sha].data,self.repo.object_store[e.sha].data)
+                finally:remote.close()
+                push_target(self.repo,self.a,url,b"refs/heads/main",target,url+"/info/lfs/objects/batch",{},self.cache,set()) # 幂等:不再发 POST
+                self.assertEqual(len(sent),5)
+                # 复现真实事故: 旧方案留下同序号但 SHA 不同的检查点 push-tmp-<目标8位>-1;先把真实引用退回一个空提交(强制)
+                from dulwich.objects import Tree
+                et=Tree();self.repo.object_store.add_object(et);ec=Commit();ec.tree=et.id;ec.author=ec.committer=b"t <t@t>";ec.author_time=ec.commit_time=0;ec.author_timezone=ec.commit_timezone=0;ec.message=b"x";ec.check();self.repo.object_store.add_object(ec)
+                stale=Measured(self.a);cl=StdlibGitClient(url,stale)
+                try:
+                    cl.send_pack("/test.git",lambda refs:{b"refs/heads/main":ec.id},lambda have,want,**k:pack_objects_to_data([(et,None),(ec,None)])) # 强制退回: 目标对象仍由旧临时引用保活
+                    oldname=b"refs/heads/push-tmp-"+target[:8]+b"-1"
+                    cl.send_pack("/test.git",lambda refs:{oldname:target},lambda have,want,**k:pack_objects_to_data([]))
+                finally:stale.close()
+                self.assertIn(oldname,{k:bare.refs[k] for k in bare.refs if k.startswith(b"refs/")})
+                self.a.force=True
+                try:
+                    push_target(self.repo,self.a,url,b"refs/heads/main",target,url+"/info/lfs/objects/batch",{},self.cache,set()) # 不得再因同名检查点报错;旧引用在收尾时被清掉
+                finally:self.a.force=False
+                self.assertEqual(bare.refs[b"refs/heads/main"],target)
+                self.assertFalse([r for r in list(bare.refs) if r.startswith(b"refs/heads/push-tmp-"+target[:8])])
+                remote=Repo(str(bare.path)) # 重开句柄;旧引用保活的全部 Blob 必须仍逐字节一致
+                try:
+                    rc=remote[remote.refs[b"refs/heads/main"]]
+                    for e in iter_tree_contents(remote.object_store,rc.tree):
+                        if e.mode in (0o100644,0o100755):self.assertEqual(remote.object_store[e.sha].data,self.repo.object_store[e.sha].data)
+                finally:remote.close()
+                stale=Measured(self.a);cl=StdlibGitClient(url,stale) # 幂等路径(目标已到位)也必须清理本目标旧命名遗留,且不动别的目标的前缀
+                try:
+                    cl.send_pack("/test.git",lambda refs:{b"refs/heads/push-tmp-"+target[:8]+b"-7":target,b"refs/heads/push-tmp-other00-1":target},lambda have,want,**k:pack_objects_to_data([]))
+                finally:stale.close()
+                push_target(self.repo,self.a,url,b"refs/heads/main",target,url+"/info/lfs/objects/batch",{},self.cache,set())
+                sr={k:bare.refs[k] for k in bare.refs if k.startswith(b"refs/")}
+                self.assertNotIn(b"refs/heads/push-tmp-"+target[:8]+b"-7",sr)
+                self.assertIn(b"refs/heads/push-tmp-other00-1",sr) # 只清本目标,不误伤并发推送
+                server_refs={k:bare.refs[k] for k in bare.refs if k.startswith(b"refs/")}
+                groups=chunk_plan_make(self.repo,target,server_refs,THRESH) # 全量已在服务端 -> 无需分块
+                self.assertIsNone(groups)
+                groups=chunk_plan_make(self.repo,target,{b"refs/heads/main":ZERO_SHA},THRESH)
+                self.assertEqual(len(groups),4) # 8+8+8+2
+                def rebuild():
+                    cum=[];parent=None;ids=[]
+                    for g in groups:
+                        cum=cum+g;parent=checkpoint_commit(self.repo,cum,parent,self.repo[target]);ids.append(parent)
+                    return ids
+                self.assertEqual(rebuild(),rebuild()) # 检查点 SHA 确定性: 断点续传靠它
+            finally:
+                globals()["Transport"]=old;server.shutdown();server.server_close();thread.join(timeout=2);bare.close()
+        def test_29_github_api_repo_url(self):
+            self.assertEqual(github_api_repo("https://github.com/eightobox/eightobox.git"),"https://api.github.com/repos/eightobox/eightobox")
+            self.assertEqual(github_api_repo("https://github.com/o/r/"),"https://api.github.com/repos/o/r")
+            self.assertEqual(github_api_repo("https://ghe.corp/team/r.git"),"https://ghe.corp/api/v3/repos/team/r")
+            self.assertIsNone(github_api_repo("http://127.0.0.1:8080/test.git")) # 本地 HTTP 测试服务不走 GitHub API
+            self.assertIsNone(github_api_repo("https://github.com/"))
     r=unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromTestCase(T));return 0 if r.wasSuccessful() else 1
 if __name__=="__main__":
     try:
