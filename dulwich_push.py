@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # pure_push.py: dulwich 1.2.15 + Python 标准库实现的全功能 git push(正确处理 gitignore/LFS/实时连接详情与速度,零外部进程)
-import argparse,base64,codecs,errno,hashlib,http.client,io,json,logging,math,os,queue,re,socket,ssl,stat,sys,tempfile,threading,time
+import argparse,base64,codecs,errno,hashlib,http.client,io,json,logging,math,os,queue,re,shutil,socket,ssl,stat,sys,tempfile,threading,time
 from collections import deque
 from contextlib import contextmanager,suppress
 from datetime import datetime
@@ -211,9 +211,9 @@ def c_quote(rel): # 把已转义的精确路径做 C 引号包装:可打印 ASCI
         elif c==13:out+=b'\\r'
         else:out.extend(f'\\{c:03o}'.encode())
     return b'"'+bytes(out)+b'"'
-def exact_pattern(rel): # 转义通配魔法符后 C 引号,保证只精确匹配该完整相对路径
+def exact_pattern(rel): # 转义通配魔法符,只精确匹配该完整相对路径;无特殊字符不加引号,有空格/控制符/引号才 C 引号
     esc=b''.join(b'\\'+bytes([c]) if c in b'\\*?[' else bytes([c]) for c in rel)
-    return c_quote(esc)+b" filter=lfs diff=lfs merge=lfs -text"
+    return esc if all(33<=c<127 and c!=34 for c in esc) else c_quote(esc)
 def pointer_info(data): # 识别标准 LFS 指针,拒绝带扩展或无效的指针再次当普通文件
     if data.startswith(POINTER_PREFIX.rstrip(b"\n")+b"\r\n"):data=data.replace(b"\r\n",b"\n")
     if not data.startswith(POINTER_PREFIX):return None
@@ -225,33 +225,51 @@ class LFSCache:
     def __init__(self,repo,config=None):
         storage=cfg(config or repo.get_config_stack(),b"lfs",b"storage");common=Path(repo.commondir()).resolve();base=Path(text(storage)).expanduser() if storage else common/"lfs"
         if not base.is_absolute():base=common/base
-        self.base=base;self.verified={}
+        self.base=base;self.verified={};self.sources={} # sources:(oid,size)->(工作区路径, file_id),零拷贝流式源,避免整文件复制撑爆磁盘
     def path(self,oid):
         if not re.fullmatch(r"[a-f0-9]{64}",oid):raise StopPush("无效的 LFS SHA256")
         return self.base/"objects"/oid[:2]/oid[2:4]/oid
-    def put(self,path): # 对工作区文件生成只读稳定快照,上传只依赖快照,不依赖上传时工作文件不变
-        tmp=self.base/"tmp";tmp.mkdir(parents=True,exist_ok=True);fd,name=tempfile.mkstemp(prefix="purepush-",dir=tmp);h=hashlib.sha256();size=0;last=time.monotonic()
-        try:
-            with os.fdopen(fd,"wb") as out,regular_reader(path) as (f,st):
-                for block in iter(lambda:f.read(1024*1024),b""):
-                    out.write(block);h.update(block);size+=len(block)
-                    if time.monotonic()-last>=1:LOG.info("LFS 本地快照: %s | %s/%s",Path(path).name,human(size),human(st.st_size));last=time.monotonic()
-                out.flush();os.fsync(out.fileno())
-            oid=h.hexdigest();dest=self.path(oid);dest.parent.mkdir(parents=True,exist_ok=True);os.replace(name,dest);self.verified[(oid,size)]=file_id(dest.stat());return pointer_bytes(oid,size)
-        finally:
-            with suppress(FileNotFoundError):os.unlink(name)
-    def require(self,oid,size):
+    def hash_source(self,path): # 只流式计算 oid/size,不落盘;读取期间文件变化由 regular_reader 直接报错
+        h=hashlib.sha256();size=0;last=time.monotonic()
+        with regular_reader(path) as (f,st):
+            for block in iter(lambda:f.read(1024*1024),b""):
+                h.update(block);size+=len(block)
+                if time.monotonic()-last>=1:LOG.info("LFS 指纹计算: %s | %s/%s",Path(path).name,human(size),human(st.st_size));last=time.monotonic()
+        return h.hexdigest(),size
+    def stage_source(self,path): # 登记工作区源并返回指针;零额外磁盘占用
+        oid,size=self.hash_source(path);p=Path(path);self.sources[(oid,size)]=(p,file_id(p.lstat()));return pointer_bytes(oid,size)
+    def import_object(self,source): # 仅手工指针场景显式导入对象,复制进缓存并校验
+        oid,size=self.hash_source(source);dest=self.path(oid);dest.parent.mkdir(parents=True,exist_ok=True)
+        if not (dest.is_file() and not dest.is_symlink() and dest.stat().st_size==size):shutil.copyfile(source,dest)
+        h=hashlib.sha256();total=0
+        with regular_reader(dest) as (f,_):
+            for block in iter(lambda:f.read(1024*1024),b""):h.update(block);total+=len(block)
+        if total!=size or h.hexdigest()!=oid:raise StopPush(f"LFS 导入损坏: {oid}")
+        self.verified[(oid,size)]=file_id(dest.stat());return oid,size
+    def has_object(self,oid,size):
         p=self.path(oid)
-        if not p.is_file() or p.is_symlink():raise StopPush(f"远端需要 LFS {oid},但本地缓存不存在;请恢复原文件/缓存后再推送,不能只发指针")
+        try:return p.is_file() and not p.is_symlink() and p.stat().st_size==size
+        except OSError:return False
+    def require(self,oid,size): # 缓存对象完整校验(oid/size/内容)
+        p=self.path(oid)
+        if not p.is_file() or p.is_symlink():raise StopPush(f"远端需要 LFS {oid[:16]},但缓存不存在;不能只发指针")
         st=p.stat()
-        if self.verified.get((oid,size))!=file_id(st):
+        if self.verified.get((oid,size))!=file_id(st) or st.st_size!=size:
             h=hashlib.sha256();total=0
             with regular_reader(p) as (f,_):
                 for block in iter(lambda:f.read(1024*1024),b""):h.update(block);total+=len(block)
             if total!=size or h.hexdigest()!=oid:raise StopPush(f"LFS 缓存损坏: {oid}")
             self.verified[(oid,size)]=file_id(p.stat())
-        if p.stat().st_size!=size:raise StopPush(f"LFS 缓存大小改变: {oid}")
         return p
+    def resolve(self,oid,size): # 上传取真实字节:缓存优先,其次工作区零拷贝源(变化即拒)
+        p=self.path(oid)
+        if p.is_file() and not p.is_symlink():return self.require(oid,size)
+        src=self.sources.get((oid,size))
+        if src is not None:
+            sp,fid=src
+            if not sp.is_file() or sp.is_symlink() or file_id(sp.lstat())!=fid:raise StopPush(f"LFS 工作区源已变化或不存在: {sp};请修复后重新运行")
+            return sp
+        raise StopPush(f"远端需要 LFS {oid[:16]},但缓存与工作区均无内容;不能只发指针")
 def walk_candidates(repo,index,manager,config): # 已跟踪路径绕过忽略;父目录被忽略也不能漏掉已跟踪后代的修改/删除
     root=Path(repo.path);tracked=dict(index.items());ignorecase=config.get_boolean((b"core",),b"ignorecase",False);lookup={os.fsdecode(k).casefold():k for k in tracked} if ignorecase else {};files={};skipped=0;count=0;last=time.monotonic();validator=get_path_element_validator(config)
     def folded(rel):return os.fsdecode(rel).casefold() if ignorecase else os.fsdecode(rel)
@@ -295,25 +313,31 @@ def normalize_blob(data,attrs,old,repo,config,path,renormalize=False): # 内建 
         if safe=="true":raise StopPush(f"core.safecrlf 拒绝不可逆换行转换: {os.fsdecode(path)}")
         LOG.warning("换行转换不可逆: %s",os.fsdecode(path))
     return converted
-def stage_all(repo,index,a,config,cache): # 直接写 Blob 与索引项,替代 porcelain.add,永不触发 filter.lfs 外部进程
+def rebuild_attributes(repo,a,manager,old_entries,large): # LFS 规则严格按当前阈值重建:全部旧 filter=lfs 行(含 *.pdf 通配/过期行)清除,非 LFS 行原样保留
+    target=Path(repo.path)/".gitattributes"
+    if target.is_symlink():raise StopPush(".gitattributes 不能是符号链接")
+    if large and os.fsencode(".gitattributes") not in old_entries and manager.is_ignored(".gitattributes") is True:raise StopPush("自动 LFS 需要 .gitattributes,但它被忽略;请调整忽略规则")
+    original=config_bytes(target);kept=[]
+    for line in original.splitlines():
+        s=line.strip();first=s.split(None,1)[0] if s else b""
+        if s and not (b"filter=lfs" in s and not first.startswith(b"[attr]")):kept.append(s) # 只删 LFS 追踪行;宏定义 [attr]x filter=lfs 与非 LFS 行保留
+    rules=sorted({exact_pattern(rel) for rel in large})
+    new=b"\n".join(kept+[r+b" filter=lfs diff=lfs merge=lfs -text" for r in rules]);new=new+b"\n" if new else b""
+    changed=new!=original
+    if changed:atomic_write(target,new);LOG.info(".gitattributes 按阈值重建: LFS 精确规则 %d 条(已清除通配/过期规则)",len(rules))
+    return changed,target
+def stage_all(repo,index,a,config,cache): # 直接写 Blob 与索引项,替代 porcelain.add,永不触发 filter.lfs 外部进程;LFS 身份只由阈值决定
     if any(not isinstance(e,IndexEntry) for _,e in index.items()):raise StopPush("索引存在未解决冲突,拒绝自动提交")
     if any(stat.S_ISDIR(e.mode) or (e.flags&0x4000) for _,e in index.items()):raise StopPush("稀疏索引/skip-worktree 不受支持,请先展开")
-    manager=ignore_manager(repo,config);files=walk_candidates(repo,index,manager,config);attrs=Attributes(repo,config,index);old_entries=dict(index.items());root=Path(repo.path);auto_rules=set()
+    manager=ignore_manager(repo,config);files=walk_candidates(repo,index,manager,config);attrs=Attributes(repo,config,index);old_entries=dict(index.items());root=Path(repo.path);large={}
     for rel,(path,oldkey) in files.items():
         st=path.lstat()
         if oldkey is not None and (old_entries[oldkey].flags&0x8000 or old_entries[oldkey].mode==0o120000):continue
-        if not stat.S_ISREG(st.st_mode) or st.st_size<a.size or a.no_auto_lfs or path.name in (".gitattributes",".gitignore",".gitmodules",".lfsconfig"):continue
-        if st.st_size<=1024 and pointer_info(read_regular(path)):continue
-        if attrs.get(rel).get(b"filter")==b"lfs":continue
-        key=os.fsencode(".gitattributes")
-        if key not in old_entries and manager.is_ignored(os.fsdecode(key)) is True:raise StopPush(f"自动 LFS 需要暂存 .gitattributes,但它被忽略;请调整忽略规则")
-        auto_rules.add(exact_pattern(rel))
-    if auto_rules:
-        target=root/".gitattributes"
-        if target.is_symlink():raise StopPush(".gitattributes 不能是符号链接")
-        original=config_bytes(target);lines=set(original.splitlines());extra=sorted(auto_rules-lines)
-        if extra:atomic_write(target,original+(b"\n" if original and not original.endswith(b"\n") else b"")+b"\n".join(extra)+b"\n");LOG.info("新增精确 LFS 规则: %d 条",len(extra))
-        key=os.fsencode(".gitattributes");files[key]=(target,key if key in old_entries else None)
+        if not stat.S_ISREG(st.st_mode) or a.no_auto_lfs or path.name in (".gitattributes",".gitignore",".gitmodules",".lfsconfig"):continue
+        if st.st_size<=1024 and pointer_info(read_regular(path)):continue # 已是指针文件,不重复判定
+        if st.st_size>=a.size:large[rel]=path # 阈值是 LFS 的唯一依据;旧 .gitattributes 说了不算
+    changed,target=rebuild_attributes(repo,a,manager,old_entries,large);key=os.fsencode(".gitattributes")
+    if changed or key in files:files[key]=(target,key if key in old_entries else None)
     attrs.invalidate();seen=set();payloads=0
     for p,e in old_entries.items():
         if e.mode==0o160000 and not (root/os.fsdecode(p)).exists():seen.add(p);LOG.warning("子模块未检出或工作树缺失,保留 gitlink: %s",os.fsdecode(p))
@@ -335,24 +359,26 @@ def stage_all(repo,index,a,config,cache): # 直接写 Blob 与索引项,替代 p
             if stat.S_ISLNK(st.st_mode):data=os.fsencode(os.readlink(path));mode=0o120000
             elif stat.S_ISREG(st.st_mode):
                 effective=attrs.get(rel)
-                if effective.get(b"filter") not in (None,False,b"lfs"):raise StopPush(f"不调用外部 filter: {os.fsdecode(rel)}")
                 if effective.get(b"working-tree-encoding") not in (None,False):raise StopPush(f"不支持 working-tree-encoding: {os.fsdecode(rel)}")
                 fmode=config.get_boolean((b"core",),b"filemode",os.name!="nt");executable=(fmode and st.st_mode&0o111) or (not fmode and old is not None and old.mode==0o100755);mode=0o100755 if executable else 0o100644
-                if effective.get(b"filter")==b"lfs":
-                    data=read_regular(path) if st.st_size<=1024 else None
-                    if data is None or pointer_info(data) is None:data=cache.put(path);payloads+=1
+                if rel in large:
+                    data=cache.stage_source(path);payloads+=1 # 零拷贝流式:登记工作区源,不复制
                 else:
-                    if st.st_size>=a.max_blob_size:raise StopPush(f"普通 Blob 超过允许大小: {os.fsdecode(rel)}；LFS 规则可能被覆盖")
+                    filt=effective.get(b"filter")
+                    if filt not in (None,False,b"lfs"):raise StopPush(f"不调用外部 filter={text(filt)}: {os.fsdecode(rel)}") # 旧通配规则里的 filter=lfs 对小文件视为无过滤器
+                    if st.st_size>=a.max_blob_size:raise StopPush(f"普通 Blob 超过允许大小: {os.fsdecode(rel)}")
                     data=normalize_blob(read_regular(path),effective,old,repo,config,rel,a.renormalize)
+                    pi=pointer_info(data) # 手工指针:缓存必须证明拥有对象,否则拒绝只发指针
+                    if pi is not None and not cache.has_object(*pi):raise StopPush(f"工作区是 LFS 指针但缓存无对象: {os.fsdecode(rel)};请恢复对象或删除指针")
                 if file_id(path.lstat())!=file_id(st):raise StopPush(f"暂存期间文件被修改: {path}")
                 blob=Blob.from_string(data);repo.object_store.add_object(blob);entry=index_entry_from_stat(st,blob.id,mode=mode)
-                if mode in (0o100644,0o100755) and attrs.get(rel).get(b"filter")=="lfs" and pointer_info(data) is None:raise StopPush(f"LFS 暂存验证失败: {path}")
+                if rel in large and pointer_info(data) is None:raise StopPush(f"LFS 暂存验证失败: {path}")
             else:raise StopPush(f"不支持的文件类型: {path}")
         if oldkey is not None and oldkey!=rel:del index[oldkey]
         index[rel]=entry;seen.add(rel)
     for rel in list(index):
         if rel not in seen:del index[rel]
-    LOG.info("索引暂存完成 | LFS 新快照: %d | 未调用任何外部过滤器",payloads)
+    LOG.info("索引暂存完成 | LFS 新指纹: %d | 零拷贝 | 未调用任何外部过滤器",payloads)
 def atomic_write(path,data): # 同目录临时文件原子替换,失败不留半写文件,不覆盖符号链接
     path=Path(path);path.parent.mkdir(parents=True,exist_ok=True)
     if path.is_symlink():raise StopPush(f"拒绝覆盖符号链接: {path}")
@@ -412,14 +438,19 @@ def commit_staged(repo,index,a,identity,expected): # 按最终 Blob 大小分批
     if not updated:raise StopPush("本地 HEAD 被其他进程更新,未覆盖")
     return ids,empty
 def prepare(repo,a,identity,cache): # 索引锁覆盖读取/扫描/写入/提交全程;失败只撤销本进程锁,对象保留
-    config=repo.get_config_stack();check_repo_state(repo,config);lock=GitFile(repo.index_path(),"wb") # 尊重已有 index.lock,不猜测过期不删别人的锁
+    config=repo.get_config_stack();check_repo_state(repo,config);du=shutil.disk_usage(Path(repo.path));LOG.info("磁盘可用空间: %s",human(du.free))
+    if du.free<1024*1024:raise StopPush("磁盘剩余空间不足 1MiB;LFS 已走零拷贝流式,请先清理其它文件")
+    lock=GitFile(repo.index_path(),"wb") # 尊重已有 index.lock,不猜测过期不删别人的锁
     try:
         expected=repo.refs.follow(b"HEAD");index=repo.open_index();stage_all(repo,index,a,config,cache);writer=SHA1Writer(lock);write_index_dict(writer,dict(index.items()),version=3);ids,empty=commit_staged(repo,index,a,identity,expected);writer.close();return ids,empty
     except BaseException:
         lock.abort();raise
-def network_error(exc): # 区分本地配置错误(不重试)与可重试网络错误
+def network_error(exc,established=False): # 区分本地配置错误(不重试)与可重试网络错误;established=True 表示 TLS 已握手成功、处于请求收发阶段
     if isinstance(exc,ssl.SSLCertVerificationError):return StopPush("TLS 证书校验失败;可用 --ca-file 指定,不会自动关闭校验")
-    if isinstance(exc,ssl.SSLError) and not isinstance(exc,(ssl.SSLEOFError,ssl.SSLZeroReturnError)):return StopPush("TLS 握手/协议错误: "+str(exc))
+    if isinstance(exc,ssl.SSLSyscallError):return NetworkFailure(f"SSL 底层连接中断({type(exc).__name__}): {exc}") # [SYS] SSL_ERROR_SYSCALL:底层 socket 读写系统调用失败(对端 RST/链路中断/超时),与证书/握手协议无关,必须重试
+    if isinstance(exc,ssl.SSLError):
+        if established:return NetworkFailure(f"已建立 TLS 连接传输中断({type(exc).__name__}): {exc}") # 握手成功后只可能在线路上出错(坏记录_MAC/注入等),按瞬断重试
+        if not isinstance(exc,(ssl.SSLEOFError,ssl.SSLZeroReturnError)):return StopPush("TLS 握手/协议错误: "+str(exc))
     if isinstance(exc,OSError) and not isinstance(exc,(ConnectionError,TimeoutError,socket.gaierror,ssl.SSLError)):
         codes={errno.ETIMEDOUT,errno.ECONNRESET,errno.ECONNABORTED,errno.ECONNREFUSED,errno.EHOSTUNREACH,errno.ENETUNREACH,errno.ENETDOWN,errno.ENETRESET,errno.EPIPE,errno.EAGAIN,errno.ENOBUFS,10051,10054,10060,10061,10065}
         if exc.errno not in codes and getattr(exc,"winerror",None) not in codes:return StopPush(f"本地网络配置/资源错误(不重试): {exc}")
@@ -493,7 +524,7 @@ class Response: # dulwich 需要的响应接口,读取与连接释放纳入监�
         if amt==0:return b""
         self.meter.check()
         try:data=self.raw.read(amt)
-        except (OSError,http.client.HTTPException) as exc:self.meter.check();raise network_error(exc) from exc
+        except (OSError,http.client.HTTPException) as exc:self.meter.check();raise network_error(exc,True) from exc
         self.meter.check();self.received+=len(data);self.meter.add(len(data))
         if not data and self.expected is not None and self.received<self.expected:raise NetworkFailure("HTTP 响应未达到声明的 Content-Length")
         return data
@@ -505,14 +536,14 @@ def request_body(data): # 请求体落临时文件:避免整包常驻内存,并�
     owned=None
     try:
         if data is None:yield None,0,0;return
-        if isinstance(data,(bytes,bytearray,memoryview)):owned=io.BytesIO(bytes(data));stream=owned
-        elif hasattr(data,"read") and hasattr(data,"seek"):stream=data
+        if isinstance(data,(bytes,bytearray,memoryview)):owned=io.BytesIO(bytes(data));stream=owned;start=0
+        elif hasattr(data,"read") and hasattr(data,"seek"):stream=data;start=stream.tell() # 尊重调用方当前位置,不强行回到 0
         else:
-            owned=tempfile.TemporaryFile();stream=owned;size=0;last=time.monotonic();LOG.info("准备 Git 请求体到临时文件,尚未开始网络上传")
+            owned=tempfile.TemporaryFile();stream=owned;start=0;size=0;last=time.monotonic();LOG.info("准备 Git 请求体到临时文件,尚未开始网络上传")
             for block in data:
                 stream.write(block);size+=len(block)
                 if time.monotonic()-last>=1:LOG.info("PACK 本地准备: %s",human(size));last=time.monotonic()
-        start=stream.tell();stream.seek(0,2);length=stream.tell()-start;stream.seek(start);yield stream,length,start
+        stream.seek(0,2);length=stream.tell()-start;stream.seek(start);yield stream,length,start
     finally:
         if owned is not None:owned.close()
 def retry_delay(value):
@@ -610,7 +641,7 @@ class Transport: # Git/LFS 共用标准库传输;默认校验证书;凭据按 or
                     for k,v in out.items():header_log(self.a,"=> Send",k,v);connection.putheader(k,v)
                     meter.switch("上传",length)
                     try:connection.endheaders()
-                    except OSError as exc:raise network_error(exc) from exc
+                    except OSError as exc:raise network_error(exc,True) from exc
                     if stream is not None:
                         stream.seek(start);remaining=length;up=time.monotonic()
                         while remaining:
@@ -620,13 +651,13 @@ class Transport: # Git/LFS 共用标准库传输;默认校验证书;凭据按 or
                             while view:
                                 meter.check()
                                 try:n=sock.send(view)
-                                except OSError as exc:raise network_error(exc) from exc
+                                except OSError as exc:raise network_error(exc,True) from exc
                                 if n<=0:raise NetworkFailure("socket 在发送请求体时关闭")
                                 meter.add(n,True);remaining-=n;view=view[n:] # 只按 socket 实际接受量计速度
                         LOG.info("[%s] 请求体已交给 socket: %s | 平均 %s/s;等待服务端确认",label,human(length),human(length/max(time.monotonic()-up,.001)))
                     meter.switch("等待响应/接收")
                     try:raw=connection.getresponse()
-                    except (OSError,http.client.HTTPException) as exc:raise network_error(exc) from exc
+                    except (OSError,http.client.HTTPException) as exc:raise network_error(exc,True) from exc
                     meter.check();trace(self.a,"<= HTTP/%s %d %s","1.1" if raw.version==11 else "1.0",raw.status,raw.reason)
                     for k,v in raw.getheaders():header_log(self.a,"<= Recv",k,v)
                     wrapper=Response(raw,connection,meter,self,url,original);self.live.add(wrapper)
@@ -718,9 +749,8 @@ def upload_lfs(net,endpoint,pointers,cache,ref,done): # batch 每组最多100;�
                 e=item["error"];raise HTTPFailure(e.get("code",422),endpoint,str(e.get("message","LFS 对象错误")))
             actions=item.get("actions") or {};up=actions.get("upload");verify=actions.get("verify")
             if up:
-                p=cache.require(oid,size);LOG.info("LFS 上传对象: %s | %s",oid[:16],human(size))
-                with regular_reader(p) as (stream,st):
-                    if file_id(st)!=cache.verified.get((oid,size)):raise StopPush("LFS 缓存在校验后被修改")
+                p=cache.resolve(oid,size);LOG.info("LFS 上传对象: %s | %s | 源: %s",oid[:16],human(size),"缓存" if str(p.parent).startswith(str(cache.base)) else "工作区流式")
+                with regular_reader(p) as (stream,st): # 读取全程变化即报错;零拷贝源直接来自工作区,无额外磁盘占用
                     r=net.request("PUT",up["href"],{"content-type":"application/octet-stream",**up.get("header",{})},stream,"LFS "+oid[:10])
                     try:read_limited(r)
                     finally:r.close()
@@ -908,16 +938,21 @@ def self_test():
         def test_08_auto_lfs_exact_rules(self):
             self.write("big.bin",b"x"*600);self.write("has space.bin",b"y"*600);self.write("化学[上册].pdf",b"z"*600);self.stage();idx=self.repo.open_index()
             for n in (b"big.bin",b"has space.bin","化学[上册].pdf".encode()):
-                oid,size=pointer_info(self.repo.object_store[idx[n].sha].data);self.assertEqual(self.cache.path(oid).stat().st_size,size)
+                oid,size=pointer_info(self.repo.object_store[idx[n].sha].data);sp,fid=self.cache.sources[(oid,size)];self.assertEqual(sp.stat().st_size,size) # 零拷贝:工作区源而非缓存副本
+            self.assertFalse((self.cache.base/"objects").exists()) # 对象目录根本不创建,不占额外磁盘
             attr=(self.root/".gitattributes").read_bytes();self.assertIn(b"big.bin",attr)
-        def test_09_manual_lfs_and_pointer_skip(self):
-            self.write(".gitattributes",b"*.lfs filter=lfs diff=lfs merge=lfs -text\n");self.write("s.lfs",b"q");oid0=self.cache.put(self.write("already.bin",b"w"*5))
-            self.write("already.bin",oid0);self.stage();idx=self.repo.open_index();self.assertIsNotNone(pointer_info(self.repo.object_store[idx[b"s.lfs"].sha].data));self.assertEqual(self.repo.object_store[idx[b"already.bin"].sha].data,oid0)
+        def test_09_manual_pointer_needs_cache(self): # 小文件不再因通配规则进 LFS;手工指针必须有缓存对象背书
+            self.write(".gitattributes",b"*.lfs filter=lfs diff=lfs merge=lfs -text\n");src=self.write("cache-src.bin",b"w"*5);oid,size=self.cache.import_object(src)
+            self.write("s.lfs",b"q");self.write("already.bin",pointer_bytes(oid,size));self.stage();idx=self.repo.open_index()
+            self.assertEqual(self.repo.object_store[idx[b"s.lfs"].sha].data,b"q") # *.lfs 通配行已按阈值清除
+            self.assertEqual(self.repo.object_store[idx[b"already.bin"].sha].data,pointer_bytes(oid,size));self.assertEqual((self.root/".gitattributes").read_bytes().find(b"*.lfs"),-1)
         def test_10_oversize_reject(self):
             self.a.max_blob_size=400;self.a.no_auto_lfs=True;self.write("big",b"v"*512)
             with self.assertRaises(StopPush):self.stage()
-        def test_11_attr_macro_cquote(self):
-            self.write(".gitattributes",b"[attr]large filter=lfs -text\n\"/has space.txt\" large\n");self.write("has space.txt",b"a");self.stage();self.assertIsNotNone(pointer_info(self.repo.object_store[self.repo.open_index()[b"has space.txt"].sha].data))
+        def test_11_attr_macro_cquote(self): # 宏展开 + 根锚定 C 引号路径匹配由 Attributes 验证;最终是否 LFS 仍由阈值裁决
+            self.write(".gitattributes",b"[attr]large filter=lfs -text\n\"/has space.txt\" large\n");self.write("has space.txt",b"a"*300)
+            attrs=Attributes(self.repo,self.repo.get_config_stack(),self.repo.open_index());self.assertEqual(attrs.get(b"has space.txt")[b"filter"],b"lfs") # [attr]large 宏已展开并匹配根锚定引号路径
+            self.stage();self.assertIsNotNone(pointer_info(self.repo.object_store[self.repo.open_index()[b"has space.txt"].sha].data))
         def test_12_crlf_normalize(self):
             self.write(".gitattributes",b"*.txt text eol=lf\n");self.write("c.txt",b"a\r\nb\r\n");self.stage();self.assertEqual(self.repo.object_store[self.repo.open_index()[b"c.txt"].sha].data,b"a\nb\n")
         def test_13_split_commits(self):
@@ -1008,7 +1043,7 @@ def self_test():
         def test_21_cli_parse(self):
             a=arguments(["-v","3","-u","push","https://u:ghp_x@github.com/u/r","--retry","4","-m","hello","world"]);self.assertEqual(a.user,"AUTO");self.assertEqual(a.message,"hello world");self.assertEqual(a.retry,4)
             a=arguments(["--remote=https://github.com/u/r","--proxy=http://127.0.0.1:8080"]);self.assertEqual(a.proxy,"http://127.0.0.1:8080")
-        def test_22_lfs_end_to_end(self): # 全链路:smart 服务器 + 独立 LFS 服务(batch/PUT/verify);二次 push 幂等不重复 batch
+        def lfs_server(self): # 独立 LFS 服务(batch/PUT/verify),返回 server/thread/endpoint/state
             state={"puts":{},"verify":0,"batch":0}
             class LH(BaseHTTPRequestHandler):
                 PORT=0;protocol_version="HTTP/1.1"
@@ -1029,13 +1064,52 @@ def self_test():
                     else:self.send_json(404,{"message":"no"})
                 def do_PUT(self):
                     state["puts"][self.path.rsplit("/",1)[-1]]=self.read_body();self.send_response(200);self.send_header("Content-Length","0");self.end_headers()
-            lfs=ThreadingHTTPServer(("127.0.0.1",0),LH);LH.PORT=lfs.server_port;tl=threading.Thread(target=lfs.serve_forever,daemon=True);tl.start()
-            self.write("big.dat",b"Z"*300);self.stage();bare,server,thread,url=self.smart_server();endpoint=f"http://127.0.0.1:{lfs.server_port}/objects/batch"
+            server=ThreadingHTTPServer(("127.0.0.1",0),LH);LH.PORT=server.server_port;thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+            return server,thread,f"http://127.0.0.1:{server.server_port}/objects/batch",state
+        def test_22_lfs_end_to_end(self): # 全链路零拷贝流式:smart + LFS(batch/PUT/verify);二次 push 幂等不重复 batch
+            self.write("big.dat",b"Z"*300);self.stage();bare,server,thread,url=self.smart_server();lfs,tl,endpoint,state=self.lfs_server()
             try:
                 for _ in range(2):push_target(self.repo,self.a,url,b"refs/heads/main",self.repo.head(),endpoint,{},self.cache,set())
                 self.assertEqual(state["batch"],1);self.assertEqual(state["verify"],1);self.assertEqual(len(state["puts"]),1);oid,blob=next(iter(state["puts"].items()));self.assertEqual(len(blob),300);self.assertEqual(hashlib.sha256(blob).hexdigest(),oid)
+                self.assertFalse((self.cache.base/"objects").exists()) # 全程零拷贝,缓存对象目录不存在
                 self.assertEqual(bare.refs[b"refs/heads/main"],self.repo.head());tree=bare[bare[bare.refs[b"refs/heads/main"]].tree];self.assertIsNotNone(pointer_info(bare.object_store[tree[b"big.dat"][1]].data))
             finally:server.shutdown();server.server_close();thread.join(timeout=2);lfs.shutdown();lfs.server_close();tl.join(timeout=2);bare.close()
+        def test_23_threshold_authoritative(self): # 复现 energetic 事故:*.pdf 通配规则 + 过期精确规则必须被阈值重建清除
+            self.write(".gitattributes",b"*.pdf filter=lfs diff=lfs merge=lfs -text\n*.epub filter=lfs diff=lfs merge=lfs -text\n\"old.pdf\" filter=lfs diff=lfs merge=lfs -text\n# \xe4\xbf\x9d\xe7\x95\x99\xe6\xb3\xa8\xe9\x87\x8a\nother.txt binary\n")
+            self.write("small.pdf",b"s"*200);self.write("old.pdf",b"o"*100);self.write("big.pdf",b"b"*300);self.stage();idx=self.repo.open_index();attr=(self.root/".gitattributes").read_bytes()
+            self.assertEqual(attr.find(b"*.pdf"),-1);self.assertEqual(attr.find(b"*.epub"),-1);self.assertEqual(attr.find(b'"old.pdf"'),-1) # 通配/过期行全清除
+            self.assertIn(b"# \xe4\xbf\x9d\xe7\x95\x99\xe6\xb3\xa8\xe9\x87\x8a",attr);self.assertIn(b"other.txt binary",attr) # 非 LFS 行保留
+            self.assertEqual(self.repo.object_store[idx[b"small.pdf"].sha].data,b"s"*200) # 49MB 类小文件:普通 Blob 不是 LFS
+            self.assertEqual(self.repo.object_store[idx[b"old.pdf"].sha].data,b"o"*100)
+            self.assertIsNotNone(pointer_info(self.repo.object_store[idx[b"big.pdf"].sha].data)) # ≥阈值才是指针
+        def test_24_source_changed_before_upload(self): # 暂存后、上传前工作区源被改动:零拷贝校验拒绝,不重试不发错误内容
+            self.write("big.dat",b"Z"*300);self.stage();(self.root/"big.dat").write_bytes(b"Z"*300+b"X") # 模拟上传前文件变化
+            bare,server,thread,url=self.smart_server();lfs,tl,endpoint,state=self.lfs_server()
+            try:
+                with self.assertRaises(StopPush):push_target(self.repo,self.a,url,b"refs/heads/main",self.repo.head(),endpoint,{},self.cache,set())
+                self.assertEqual(len(state["puts"]),0) # 一个字节都不允许上传
+            finally:server.shutdown();server.server_close();thread.join(timeout=2);lfs.shutdown();lfs.server_close();tl.join(timeout=2);bare.close()
+        def test_25_disk_space_preflight(self): # 磁盘不足 1MiB:在拿索引锁之前直接拒绝
+            real=shutil.disk_usage(self.root);tiny=type(real)(real.total,real.total-1,1);old=shutil.disk_usage;shutil.disk_usage=lambda p:tiny
+            try:
+                with self.assertRaises(StopPush):self.stage()
+                self.assertFalse((self.root/".git"/"index.lock").exists()) # 预检失败不得留锁
+            finally:shutil.disk_usage=old
+        def test_26_request_body_generator(self): # generator 经临时文件 spool:length 不得为 0,且 307 重放内容完整
+            with request_body(x for x in [b"abc",b"def",b"g"]) as (stream,length,start):
+                self.assertEqual(length,7);self.assertEqual(stream.read(),b"abcdefg") # 消费后 start=0,不是末尾
+            bio=io.BytesIO(b"zzzpayload");bio.read(2) # 调用方预置位置必须尊重
+            with request_body(bio) as (stream,length,start):self.assertEqual(start,2);self.assertEqual(length,8);self.assertEqual(stream.read(),b"zpayload")
+        def test_27_ssl_error_classification(self): # [SYS] SSL_ERROR_SYSCALL 是底层连接中断,必须可重试;握手期的通用协议错误才致命
+            syscall=ssl.SSLSyscallError(0,"[SYS] unknown error (_ssl.c:2417)")
+            self.assertIsInstance(network_error(syscall),NetworkFailure)
+            self.assertIsInstance(network_error(syscall,True),NetworkFailure)
+            self.assertTrue(is_retryable(network_error(syscall)))
+            self.assertIsInstance(network_error(ssl.SSLEOFError("unexpected eof")),NetworkFailure)
+            self.assertIsInstance(network_error(ssl.SSLZeroReturnError("closed")),NetworkFailure)
+            self.assertIsInstance(network_error(ssl.SSLError(1,"[SSL: WRONG_VERSION_NUMBER]")),StopPush) # 握手期协议/中间人问题不盲目重试
+            self.assertIsInstance(network_error(ssl.SSLError(1,"[SSL: BAD_DECRYPT]"),True),NetworkFailure) # 同一错误发生在收发阶段则按线路瞬断重试
+            self.assertIsInstance(network_error(ssl.SSLCertVerificationError("cert verify failed")),StopPush)
     r=unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromTestCase(T));return 0 if r.wasSuccessful() else 1
 if __name__=="__main__":
     try:
