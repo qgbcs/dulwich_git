@@ -18,7 +18,7 @@ CACHE_PREFIX = "#lfs-cache\t"
 # CACHE_PREFIX = "# purepush-lfs-cache\t"  # 模块级常量,与 pure_push.py 保持一致
 CHUNK = 1024 * 1024
 HEX64 = re.compile(r"[0-9a-f]{64}")
-
+cache_file="qgb-lfs-cache.txt"
 
 def find_git_dir(root):
     """从 root 向上找 .git;支持 .git 是目录(普通仓库)或文件(worktree/submodule)。找不到返回 None。"""
@@ -95,7 +95,7 @@ def scan_large_files(root, min_size, reuse_cache=True, emit=None):
     git_dir = find_git_dir(root)
     if git_dir is None:
         raise SystemExit(f"在 {root} 及上级目录找不到 .git;请确认这是仓库根或子目录")
-    cfg_path = git_dir / "config"
+    cfg_path = git_dir / cache_file
 
     old = load_old_cache(cfg_path) if reuse_cache else {}
     emit(f"# 仓库根: {root}")
@@ -154,7 +154,7 @@ def scan_large_files(root, min_size, reuse_cache=True, emit=None):
 def write_cache_to_config(git_dir, lines):
     """把缓存行写回 .git/config:先删掉所有同前缀旧行,再把新行追加到末尾。
     只动注释行,绝不动任何真实配置;用 atomic_write 保证不写半截。"""
-    cfg_path = Path(git_dir) / "config"
+    cfg_path = Path(git_dir) / cache_file
     if not cfg_path.exists():
         raise SystemExit(f".git/config 不存在: {cfg_path}")
     try:

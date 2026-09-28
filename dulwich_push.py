@@ -1065,7 +1065,7 @@ def make_parser():
     p.add_argument("--proxy");p.add_argument("--no-proxy",action="store_true");p.add_argument("--ca-file");p.add_argument("--lfs-url");p.add_argument("--no-auto-lfs",action="store_true");p.add_argument("--renormalize",action="store_true");p.add_argument("--force",action="store_true");p.add_argument("--force-with-lease",nargs="?",const="auto");p.add_argument("--set-upstream",action="store_true");p.add_argument("--push-option",action="append",default=[]);p.add_argument("--atomic",action="store_true");p.add_argument("--self-test",action="store_true")
     return p
 def arguments(argv=None):
-    p=make_parser();a=p.parse_args(preprocess(list(sys.argv[1:] if argv is None else argv)));a.trace=a.verbose>=3
+    p=make_parser();a=p.parse_args(preprocess(list(sys.argv[1:] if not argv else argv)));a.trace=a.verbose>=3
     if a.threshold>0:a.size=a.threshold
     vals=(a.connect_timeout,a.io_timeout,a.progress_interval,a.retry_wait,a.low_speed_time)
     if not all(math.isfinite(x) for x in vals):p.error("时间参数不能是 NaN 或无穷大")
